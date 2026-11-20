@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Walk-in WebAR</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  #intro { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; text-align: center; }
+  #intro h1 { margin: 0; font-size: 22px; }
+  #intro p { margin: 0; max-width: 340px; opacity: .75; font-size: 14px; line-height: 1.5; }
+  #status { font-size: 13px; opacity: .8; }
+  #overlay { position: fixed; inset: 0; pointer-events: none; display: none; }
+  #hint { position: absolute; top: 16px; left: 0; right: 0; text-align: center; font-size: 15px; text-shadow: 0 1px 4px #000; }
+  #controls { position: absolute; bottom: 20px; left: 0; right: 0; display: none; flex-wrap: wrap; gap: 8px; justify-content: center; padding: 0 12px; }
+  button.ui { pointer-events: auto; background: rgba(0,0,0,.65); color: #fff; border: 1px solid rgba(255,255,255,.35); border-radius: 10px; padding: 10px 14px; font-size: 14px; }
+  #startBtn { background: #fff; color: #000; border: 0; padding: 14px 28px; border-radius: 12px; font-size: 16px; font-weight: 600; }
+  #startBtn:disabled { opacity: .4; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="intro">
+  <h1>Walk-in AR</h1>
+  <p>Stand where you want the entrance to be, point your phone at the floor, tap to place the scene, then walk inside.</p>
+  <button id="startBtn" disabled>Loading model…</button>
+  <div id="status"></div>
+</div>
+
+<div id="overlay">
+  <div id="hint">Point at the floor, then tap to place</div>
+  <div id="controls">
+    <button class="ui" data-act="rotL">⟲ Rotate</button>
+    <button class="ui" data-act="rotR">Rotate ⟳</button>
+    <button class="ui" data-act="up">Raise</button>
+    <button class="ui" data-act="down">Lower</button>
+    <button class="ui" data-act="big">Scale +</button>
+    <button class="ui" data-act="small">Scale −</button>
+    <button class="ui" data-act="replace">Re-place</button>
+    <button class="ui" data-act="exit">Exit</button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+/* ---------- CONFIG ---------- */
+const MODEL_URL = './3DVW.glb';
+// Where the visitor should "appear" inside the scene, in BLENDER coordinates (meters).
+// e.g. the doorway of your hall. (0,0,0) = Blender world origin.
+const SPAWN_BLENDER = { x: 0, y: 0, z: 0 };
+/* ---------------------------- */
+
+const $ = (id) => document.getElementById(id);
+const startBtn = $('startBtn'), statusEl = $('status'), overlay = $('overlay'),
+      hint = $('hint'), controls = $('controls');
+
+// Blender (Z-up) -> glTF/three (Y-up)
+const spawnLocal = new THREE.Vector3(SPAWN_BLENDER.x, SPAWN_BLENDER.z, -SPAWN_BLENDER.y);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 200);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x888888, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(2, 5, 3);
+scene.add(sun);
+
+// Reticle
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.12, 0.16, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0x00ffaa })
+);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+// Model
+let model = null;
+const root = new THREE.Group();   // placed in the real world
+root.visible = false;
+scene.add(root);
+
+const draco = new DRACOLoader().setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/');
+const loader = new GLTFLoader().setDRACOLoader(draco).setMeshoptDecoder(MeshoptDecoder);
+loader.load(MODEL_URL, (gltf) => {
+  model = gltf.scene;
+  model.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
+  root.add(model);
+  startBtn.disabled = false;
+  startBtn.textContent = 'Start AR';
+}, (e) => {
+  if (e.total) statusEl.textContent = `Loading ${(e.loaded / e.total * 100).toFixed(0)}%`;
+}, (err) => {
+  console.error(err);
+  statusEl.textContent = 'Could not load 3DVW.glb — is it next to index.html?';
+});
+
+// State
+let hitTestSource = null, placed = false, yawOffset = 0, userScale = 1, session = null;
+
+function applyPlacement(anchorPos, yaw) {
+  root.rotation.set(0, yaw, 0);
+  root.scale.setScalar(userScale);
+  // put the SPAWN point of the model exactly at anchorPos
+  const off = spawnLocal.clone().multiplyScalar(userScale).applyEuler(root.rotation);
+  root.position.copy(anchorPos).sub(off);
+}
+let anchorPos = new THREE.Vector3(), baseYaw = 0;
+
+function place() {
+  if (!reticle.visible || !model) return;
+  anchorPos.setFromMatrixPosition(reticle.matrix);
+  // face the way the phone is facing
+  const cam = renderer.xr.getCamera();
+  const dir = new THREE.Vector3(); cam.getWorldDirection(dir);
+  baseYaw = Math.atan2(-dir.x, -dir.z);
+  yawOffset = 0;
+  applyPlacement(anchorPos, baseYaw);
+  root.visible = true; placed = true;
+  reticle.visible = false;
+  hint.textContent = 'Walk around! Use the buttons to fine-tune.';
+  controls.style.display = 'flex';
+  setTimeout(() => { if (placed) hint.style.display = 'none'; }, 4000);
+}
+
+// Tap = select event (UI buttons call preventDefault on beforexrselect)
+const controller = renderer.xr.getController(0);
+controller.addEventListener('select', () => { if (!placed) place(); });
+scene.add(controller);
+
+document.querySelectorAll('#controls button').forEach((b) => {
+  b.addEventListener('beforexrselect', (e) => e.preventDefault());
+  b.addEventListener('click', () => {
+    const a = b.dataset.act;
+    if (a === 'rotL') yawOffset += THREE.MathUtils.degToRad(10);
+    if (a === 'rotR') yawOffset -= THREE.MathUtils.degToRad(10);
+    if (a === 'up') anchorPos.y += 0.03;
+    if (a === 'down') anchorPos.y -= 0.03;
+    if (a === 'big') userScale *= 1.05;
+    if (a === 'small') userScale /= 1.05;
+    if (a === 'replace') { placed = false; root.visible = false; controls.style.display = 'none'; hint.style.display = ''; hint.textContent = 'Point at the floor, then tap to place'; return; }
+    if (a === 'exit') { session && session.end(); return; }
+    applyPlacement(anchorPos, baseYaw + yawOffset);
+  });
+});
+$('overlay').addEventListener('beforexrselect', (e) => e.preventDefault());
+
+// Start AR
+startBtn.addEventListener('click', async () => {
+  if (!navigator.xr || !(await navigator.xr.isSessionSupported('immersive-ar'))) {
+    statusEl.textContent = 'WebXR AR is not supported on this browser. Use Chrome on an ARCore-supported Android phone.';
+    return;
+  }
+  session = await navigator.xr.requestSession('immersive-ar', {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['dom-overlay', 'local-floor'],
+    domOverlay: { root: overlay }
+  });
+  await renderer.xr.setSession(session);
+  const viewerSpace = await session.requestReferenceSpace('viewer');
+  hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+  overlay.style.display = 'block';
+  $('intro').style.display = 'none';
+  session.addEventListener('end', () => {
+    hitTestSource = null; placed = false; root.visible = false; reticle.visible = false;
+    overlay.style.display = 'none'; controls.style.display = 'none';
+    hint.style.display = ''; hint.textContent = 'Point at the floor, then tap to place';
+    $('intro').style.display = 'flex';
+  });
+});
+
+renderer.setAnimationLoop((t, frame) => {
+  if (frame && hitTestSource && !placed) {
+    const hits = frame.getHitTestResults(hitTestSource);
+    if (hits.length) {
+      const pose = hits[0].getPose(renderer.xr.getReferenceSpace());
+      reticle.visible = true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+    } else reticle.visible = false;
+  }
+  renderer.render(scene, camera);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
