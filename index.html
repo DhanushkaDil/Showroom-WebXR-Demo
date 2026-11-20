@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Walk-in AR</title>
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <style>
+    #overlay { position: fixed; inset: 0; pointer-events: none; }
+    #hint { position: absolute; top: 12px; left: 0; right: 0; text-align: center;
+            font: 15px sans-serif; color: #fff; text-shadow: 0 0 4px #000;
+            transition: opacity 1s; }
+  </style>
+</head>
+<body>
+  <!-- dracoDecoderPath lets A-Frame open Draco-compressed GLBs -->
+  <a-scene
+    renderer="alpha: true"
+    xr-mode-ui="XRMode: ar"
+    gltf-model="dracoDecoderPath: https://www.gstatic.com/draco/versioned/decoders/1.5.6/"
+    webxr="optionalFeatures: dom-overlay, local-floor; overlayElement: #overlay">
+
+    <!-- Position/rotation of this entity are set by the script below -->
+    <a-entity id="room">
+      <a-entity gltf-model="url(3DVW.glb)"></a-entity>
+    </a-entity>
+
+    <a-light type="ambient" intensity="1.2"></a-light>
+    <a-light type="directional" intensity="0.8" position="2 5 3"></a-light>
+
+    <!-- Camera = your phone. In AR its position/rotation come from the phone's tracking. -->
+    <a-entity camera position="0 1.6 0" look-controls></a-entity>
+  </a-scene>
+
+  <div id="overlay">
+    <div id="hint">Look the way you want to enter, then walk into the scene</div>
+  </div>
+
+  <script>
+    /* ---------- CONFIG ---------- */
+    // Where the visitor appears inside the scene, in BLENDER coordinates (meters).
+    // (0,0,0) = Blender world origin. Set this to the doorway/entrance of your hall.
+    const SPAWN_BLENDER = { x: 0, y: 0, z: 0 };
+    // Extra turn of the scene (degrees) so the visitor faces the right direction at start.
+    const SPAWN_YAW_DEG = 0;
+    // Move the floor up/down (meters) if the scene floor looks too high/low in AR.
+    const FLOOR_OFFSET = 0;
+    /* ---------------------------- */
+
+    const sceneEl = document.querySelector('a-scene');
+    const room = document.getElementById('room').object3D;
+    const hint = document.getElementById('hint');
+
+    function placeRoom() {
+      // Blender (Z-up) -> three.js/glTF (Y-up)
+      const spawn = new THREE.Vector3(SPAWN_BLENDER.x, SPAWN_BLENDER.z, -SPAWN_BLENDER.y);
+      const yaw = THREE.MathUtils.degToRad(SPAWN_YAW_DEG);
+      room.rotation.set(0, yaw, 0);
+      // put the spawn point exactly where the phone starts (the AR origin)
+      const off = spawn.clone().applyEuler(room.rotation);
+      let floorY = FLOOR_OFFSET;
+      // If the device only gave us a 'local' space, y=0 is eye height, not floor
+      const refType = sceneEl.systems.webxr && sceneEl.systems.webxr.sessionReferenceSpaceType;
+      if (refType === 'local') floorY -= 1.4;
+      room.position.set(-off.x, floorY - off.y, -off.z);
+    }
+
+    // Runs when the AR session starts: the phone's start position becomes the origin.
+    sceneEl.addEventListener('enter-vr', () => {
+      if (!sceneEl.is('ar-mode')) return;
+      placeRoom();
+      setTimeout(() => { hint.style.opacity = 0; }, 5000);
+    });
+
+    // Also place it once for desktop preview (WASD isn't needed; drag to look)
+    sceneEl.addEventListener('loaded', placeRoom);
+  </script>
+</body>
+</html>
